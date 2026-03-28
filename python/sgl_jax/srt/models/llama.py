@@ -537,10 +537,9 @@ class LlamaForCausalLM(nnx.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def get_embed_and_head(self):
-        return (
-            self.model.embed_tokens.embedding.value,
-            self.lm_head.embedding.value,
-        )
+        embed = self.model.embed_tokens.embedding.value
+        head = self.lm_head.embedding.value if hasattr(self, "lm_head") else embed
+        return (embed, head)
 
     def set_embed_and_head(
         self,
