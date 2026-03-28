@@ -277,6 +277,9 @@ class Qwen2Model(nnx.Module):
             param_dtype=dtype,
         )
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -293,7 +296,12 @@ class Qwen2Model(nnx.Module):
         )
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer in self.layers:
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             hidden_states, residual, kv_fused, callback_flag = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -308,7 +316,7 @@ class Qwen2Model(nnx.Module):
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        return hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class Qwen2ForCausalLM(nnx.Module):
@@ -323,6 +331,8 @@ class Qwen2ForCausalLM(nnx.Module):
         self.dtype = dtype
         logger.info("Qwen2ForCausalLM config dtype: %s", self.dtype)
         self.model = Qwen2Model(config, dtype=self.dtype, mesh=mesh)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -464,10 +474,23 @@ class Qwen2ForCausalLM(nnx.Module):
         return mappings
 
     def get_embed_and_head(self):
-        return (
-            self.model.embed_tokens.embedding.value,
-            self.lm_head.embedding.value,
-        )
+        embed = self.model.embed_tokens.embedding.value
+        head = self.lm_head.embedding.value if hasattr(self, "lm_head") else embed
+        return (embed, head)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            # +1 because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_embed_and_head(
         self,
@@ -494,13 +517,19 @@ class Qwen2ForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, token_to_kv_pool
         )
+        if not self.capture_aux_hidden_states:
+            aux_hidden_states = None
         if not getattr(self.config, "tie_word_embeddings", False):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+            output = self.logits_processor(
+                hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
+            )
         else:
-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+            output = self.logits_processor(
+                hidden_states, self.model.embed_tokens, logits_metadata, aux_hidden_states=aux_hidden_states
+            )
         return output, layers_kv_fused, layers_callback_flag, None
 
 
